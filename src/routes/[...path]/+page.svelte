@@ -3,6 +3,11 @@
 	import { registry } from '$lib/stores/registry.svelte';
 	import { loadModule } from '$lib/modules';
 
+	let container = $state<HTMLDivElement | null>(null);
+	let loadError = $state<string | null>(null);
+	let mountedInstance = $state<unknown>(null);
+	let mountedModuleId = $state<string | null>(null);
+
 	// Find the module that owns this path
 	let currentModule = $derived(
 		registry.modules.find((m) =>
@@ -10,23 +15,45 @@
 		) ?? null
 	);
 
-	// Loaded component — null while loading, undefined if no module matches
-	let component = $state<unknown>(null);
-	let loadError = $state<string | null>(null);
-
 	$effect(() => {
-		if (!currentModule) {
-			component = null;
+		const mod = currentModule;
+		const target = container;
+
+		if (!mod || !target) {
+			unmountCurrent();
 			return;
 		}
+
+		// Already mounted — no-op
+		if (mountedModuleId === mod.id) return;
+
+		unmountCurrent();
 		loadError = null;
-		loadModule(currentModule)
-			.then((c) => { component = c; })
+
+		loadModule(mod)
+			.then((fpmod) => {
+				if (!container) return; // navigated away
+				mountedInstance = fpmod.mount(container);
+				mountedModuleId = mod.id;
+			})
 			.catch((e) => {
 				loadError = e instanceof Error ? e.message : 'Failed to load module';
 				console.error('[FuzzyPeanut] Module load error:', e);
 			});
 	});
+
+	function unmountCurrent() {
+		if (mountedInstance && mountedModuleId) {
+			const cached = registry.modules.find((m) => m.id === mountedModuleId);
+			if (cached) {
+				loadModule(cached)
+					.then((fpmod) => fpmod.unmount(mountedInstance))
+					.catch(() => {});
+			}
+		}
+		mountedInstance = null;
+		mountedModuleId = null;
+	}
 </script>
 
 {#if !currentModule}
@@ -39,14 +66,18 @@
 		<h2>Module failed to load</h2>
 		<p>{loadError}</p>
 	</div>
-{:else if !component}
+{:else if !mountedInstance}
 	<div class="loading">
 		<span class="spinner"></span>
 	</div>
-{:else}
-	{@const DynamicModule = component as import('svelte').Component}
-	<DynamicModule />
 {/if}
+
+<!-- Module mounts into this div via fpmod.mount(container) -->
+<div
+	bind:this={container}
+	class="module-container"
+	class:hidden={!mountedInstance}
+></div>
 
 <style>
 	.not-found, .error, .loading {
@@ -73,4 +104,11 @@
 	@keyframes spin {
 		to { transform: rotate(360deg); }
 	}
+
+	.module-container {
+		width: 100%;
+		height: 100%;
+	}
+
+	.hidden { display: none; }
 </style>

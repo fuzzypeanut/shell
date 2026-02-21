@@ -1,27 +1,37 @@
 import type { ModuleInfo } from '@fuzzypeanut/sdk';
 
-const cache = new Map<string, unknown>();
+/**
+ * The interface every FuzzyPeanut module must export as its default.
+ * Modules use their own bundled Svelte runtime to mount into the target div —
+ * no cross-Svelte-instance rendering, no fragile component interop.
+ */
+export interface FPModule {
+	mount(target: HTMLElement, props?: Record<string, unknown>): unknown;
+	unmount(instance: unknown): void;
+}
+
+const cache = new Map<string, FPModule>();
 
 /**
- * Dynamically load a module's Svelte component from its remoteEntry URL.
- *
- * The module's remoteEntry.js must be a standard ES module with a default
- * export of the top-level Svelte component. The shell SDK is available on
- * window.__fuzzyPeanutSDK before this import fires, so modules can call
- * getSDK() from @fuzzypeanut/sdk without any additional setup.
- *
+ * Load a module's remoteEntry.js and return its FPModule interface.
  * Safe to call multiple times — cached after first load.
  */
-export async function loadModule(mod: ModuleInfo): Promise<unknown> {
-	if (cache.has(mod.id)) return cache.get(mod.id);
+export async function loadModule(mod: ModuleInfo): Promise<FPModule> {
+	if (cache.has(mod.id)) return cache.get(mod.id)!;
 
-	// Dynamic import from an external URL.
-	// @vite-ignore suppresses Vite's warning about non-static import expressions.
+	// @vite-ignore — dynamic import from an external URL
 	const remote = await import(/* @vite-ignore */ mod.remoteEntry);
-	const component = remote.default ?? remote;
+	const fpmod: FPModule = remote.default ?? remote;
 
-	cache.set(mod.id, component);
-	return component;
+	if (typeof fpmod?.mount !== 'function') {
+		throw new Error(
+			`[FuzzyPeanut] Module "${mod.id}" remoteEntry does not export { mount, unmount }. ` +
+			'See https://github.com/fuzzypeanut/sdk for the module contract.'
+		);
+	}
+
+	cache.set(mod.id, fpmod);
+	return fpmod;
 }
 
 export function evictModule(id: string) {
