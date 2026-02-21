@@ -1,14 +1,7 @@
-import type { ModuleInfo } from '@fuzzypeanut/sdk';
+import type { FPModule, ModuleInfo } from '@fuzzypeanut/sdk';
 
-/**
- * The interface every FuzzyPeanut module must export as its default.
- * Modules use their own bundled Svelte runtime to mount into the target div —
- * no cross-Svelte-instance rendering, no fragile component interop.
- */
-export interface FPModule {
-	mount(target: HTMLElement, props?: Record<string, unknown>): unknown;
-	unmount(instance: unknown): void;
-}
+// Re-export so callers can import FPModule from here without touching the SDK directly.
+export type { FPModule };
 
 const cache = new Map<string, FPModule>();
 

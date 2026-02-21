@@ -1,26 +1,126 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { page } from '$app/stores';
 	import { auth } from '$lib/stores/auth.svelte';
 	import { registry } from '$lib/stores/registry.svelte';
 	import { notifications } from '$lib/stores/notifications.svelte';
 	import { theme } from '$lib/stores/theme.svelte';
 	import { setupSDK } from '$lib/sdk';
-	import type { ModuleInfo } from '@fuzzypeanut/sdk';
+	import { loadModule, evictModule } from '$lib/modules';
+	import { eventBus } from '$lib/events';
+	import type { FPModule, ModuleInfo } from '@fuzzypeanut/sdk';
 
 	let { children } = $props();
 
 	let ready = $state(false);
 
-	onMount(async () => {
-		// 1. Inject the SDK singleton — must happen before any module loads
-		setupSDK();
-		// 2. Init auth — redirects to Authentik if not logged in
-		await auth.init();
-		// 3. Load registered modules from the registry service
-		await registry.load();
-		// 4. Subscribe to SSE for live module registration changes
-		subscribeToRegistryEvents();
+	// ─── Module dock (stay-alive) ─────────────────────────────────────────────
 
+	type MountEntry = { fpmod: FPModule; instance: unknown; el: HTMLDivElement };
+	// Plain Map — not reactive. Effects track reactive deps (registry.modules, currentModule)
+	// and mutate this imperatively.
+	const mountedModules = new Map<string, MountEntry>();
+
+	let dock = $state<HTMLDivElement | null>(null);
+	let activeModuleId = $state<string | null>(null);
+	let loadingModuleId = $state<string | null>(null);
+	let moduleLoadError = $state<string | null>(null);
+
+	// Current module based on URL path
+	let currentPath = $derived(`/${$page.params.path ?? ''}`);
+	let currentModule = $derived(
+		registry.modules.find((m: ModuleInfo) =>
+			m.routes.some((r) => currentPath.startsWith(r))
+		) ?? null
+	);
+
+	// React to route changes: deactivate old module, activate or mount new one
+	$effect(() => {
+		const mod = currentModule;
+		const dockEl = dock;
+		if (!dockEl || !ready) return;
+
+		const newId = mod?.id ?? null;
+		if (newId === activeModuleId) return;
+
+		// Deactivate previous
+		if (activeModuleId) {
+			const prev = mountedModules.get(activeModuleId);
+			if (prev) {
+				prev.fpmod.onInactive?.(prev.instance);
+				prev.el.style.display = 'none';
+			}
+		}
+
+		moduleLoadError = null;
+		activeModuleId = newId;
+
+		if (!mod || !newId) return;
+
+		// Already mounted — show and activate
+		const existing = mountedModules.get(newId);
+		if (existing) {
+			existing.el.style.display = '';
+			existing.fpmod.onActive?.(existing.instance);
+			return;
+		}
+
+		// First visit — create container, mount module
+		loadingModuleId = newId;
+		const el = document.createElement('div');
+		el.className = 'module-container';
+		el.style.display = 'none'; // hidden until mount completes
+		dockEl.appendChild(el);
+
+		loadModule(mod)
+			.then((fpmod) => {
+				if (activeModuleId !== newId) {
+					// User navigated away before load finished
+					el.remove();
+					return;
+				}
+				const instance = fpmod.mount(el);
+				mountedModules.set(newId, { fpmod, instance, el });
+				el.style.display = '';
+				fpmod.onActive?.(instance);
+			})
+			.catch((err) => {
+				el.remove();
+				if (activeModuleId === newId) {
+					moduleLoadError = err instanceof Error ? err.message : 'Failed to load module';
+				}
+				console.error('[FuzzyPeanut] Module load error:', err);
+			})
+			.finally(() => {
+				if (loadingModuleId === newId) loadingModuleId = null;
+			});
+	});
+
+	// Handle module deregistration — unmount mounted instances, evict cache
+	$effect(() => {
+		// Reading registry.modules triggers this effect when the list changes
+		const currentIds = new Set(registry.modules.map((m: ModuleInfo) => m.id));
+		for (const [id, entry] of mountedModules) {
+			if (!currentIds.has(id)) {
+				entry.fpmod.unmount(entry.instance);
+				entry.el.remove();
+				mountedModules.delete(id);
+				evictModule(id);
+				if (activeModuleId === id) {
+					activeModuleId = null;
+					moduleLoadError = 'This module is no longer available.';
+				}
+			}
+		}
+	});
+
+	// ─── App init ─────────────────────────────────────────────────────────────
+
+	onMount(async () => {
+		setupSDK();
+		await auth.init();
+		await registry.load();
+		subscribeToRegistryEvents();
 		ready = true;
 	});
 
@@ -34,9 +134,11 @@
 				// ignore malformed events
 			}
 		};
+		// EventSource auto-reconnects on network drops — no manual retry needed
 	}
 
-	// Sorted nav items from all installed modules
+	// ─── Nav ──────────────────────────────────────────────────────────────────
+
 	let navItems = $derived(
 		[...registry.modules]
 			.filter((m: ModuleInfo) => m.nav)
@@ -63,7 +165,12 @@
 			<ul class="nav-items">
 				{#each navItems as mod (mod.id)}
 					<li>
-						<a href={mod.routes[0]} class="nav-item">
+						<a
+							href={mod.routes[0]}
+							class="nav-item"
+							class:active={currentModule?.id === mod.id}
+							aria-current={currentModule?.id === mod.id ? 'page' : undefined}
+						>
 							<span class="nav-icon">{mod.nav?.icon ?? '●'}</span>
 							<span class="nav-label">{mod.nav?.label}</span>
 						</a>
@@ -93,7 +200,23 @@
 		</nav>
 
 		<main class="content">
-			{@render children()}
+			<!-- Module dock: all mounted module containers live here, shown/hidden by route -->
+			<div bind:this={dock} class="module-dock">
+				{#if loadingModuleId}
+					<div class="module-state">
+						<span class="spinner"></span>
+					</div>
+				{:else if moduleLoadError}
+					<div class="module-state module-error">
+						<p>{moduleLoadError}</p>
+					</div>
+				{/if}
+			</div>
+
+			<!-- Non-module page content (auth/callback, root empty state, etc.) -->
+			{#if !currentModule}
+				{@render children()}
+			{/if}
 		</main>
 
 		{#if notifications.items.length > 0}
@@ -103,8 +226,25 @@
 						<div class="notification-body">
 							<strong>{n.title}</strong>
 							{#if n.message}<p>{n.message}</p>{/if}
+							{#if n.actions.length > 0}
+								<div class="notification-actions">
+									{#each n.actions as action}
+										<button
+											class="notification-action"
+											onclick={() => {
+												eventBus.emit(action.event, action.payload);
+												notifications.dismiss(n.id);
+											}}
+										>{action.label}</button>
+									{/each}
+								</div>
+							{/if}
 						</div>
-						<button onclick={() => notifications.dismiss(n.id)} aria-label="Dismiss">✕</button>
+						<button
+							class="notification-dismiss"
+							onclick={() => notifications.dismiss(n.id)}
+							aria-label="Dismiss"
+						>✕</button>
 					</div>
 				{/each}
 			</div>
@@ -207,8 +347,12 @@
 		font-size: 0.9rem;
 	}
 
-	.nav-item:hover {
+	.nav-item:hover { background: var(--fp-border); }
+
+	.nav-item.active {
 		background: var(--fp-border);
+		color: var(--fp-primary);
+		font-weight: 600;
 	}
 
 	.sidebar-footer {
@@ -265,7 +409,33 @@
 
 	.content {
 		flex: 1;
+		overflow: hidden;
+		position: relative;
+	}
+
+	.module-dock {
+		width: 100%;
+		height: 100%;
+		position: relative;
+	}
+
+	:global(.module-container) {
+		width: 100%;
+		height: 100%;
 		overflow: auto;
+	}
+
+	.module-state {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		height: 100%;
+	}
+
+	.module-error {
+		color: var(--fp-text);
+		opacity: 0.5;
+		font-size: 0.9rem;
 	}
 
 	.notifications {
@@ -291,14 +461,35 @@
 	}
 
 	.notification-body { flex: 1; }
+	.notification-body strong { display: block; font-size: 0.9rem; margin-bottom: 0.2rem; }
+	.notification-body p { font-size: 0.83rem; opacity: 0.75; }
 
-	.notification button {
+	.notification-actions {
+		display: flex;
+		gap: 0.5rem;
+		margin-top: 0.5rem;
+	}
+
+	.notification-action {
+		padding: 0.25rem 0.6rem;
+		border: 1px solid var(--fp-border);
+		border-radius: 4px;
+		background: none;
+		color: var(--fp-primary);
+		font-size: 0.8rem;
+		cursor: pointer;
+	}
+
+	.notification-action:hover { background: var(--fp-border); }
+
+	.notification-dismiss {
 		background: none;
 		border: none;
 		cursor: pointer;
 		color: var(--fp-text);
-		opacity: 0.5;
+		opacity: 0.4;
 		flex-shrink: 0;
+		font-size: 0.85rem;
 	}
 
 	.notification--error { border-left: 3px solid #e53e3e; }

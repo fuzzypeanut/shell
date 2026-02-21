@@ -1,5 +1,6 @@
 import { config } from '$lib/config';
 import type { ModuleInfo } from '@fuzzypeanut/sdk';
+import { evictModule } from '$lib/modules';
 
 class RegistryStore {
 	modules = $state<ModuleInfo[]>([]);
@@ -28,6 +29,7 @@ class RegistryStore {
 
 	#removeModule(id: string) {
 		this.modules = this.modules.filter((m) => m.id !== id);
+		evictModule(id);
 		this.#removeListeners.get(id)?.forEach((cb) => cb());
 	}
 
